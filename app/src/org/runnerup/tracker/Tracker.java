@@ -78,8 +78,7 @@ import java.util.List;
  */
 
 @TargetApi(Build.VERSION_CODES.FROYO)
-public class Tracker extends android.app.Service implements
-        LocationListener, Constants {
+public class Tracker extends android.app.Service implements Constants {
     public static final int MAX_HR_AGE = 3000; // 3s
 
     private final Handler handler = new Handler();
@@ -649,7 +648,6 @@ public class Tracker extends android.app.Service implements
         return mActivityId;
     }
 
-    @Override
     public void onLocationChanged(Location arg0) {
         //Elevation depends on GPS updates
         trackerElevation.onLocationChanged(arg0);
@@ -732,18 +730,6 @@ public class Tracker extends android.app.Service implements
         for (WorkoutObserver l : liveLoggers) {
             l.workoutEvent(workout, type);
         }
-    }
-
-    @Override
-    public void onProviderDisabled(String arg0) {
-    }
-
-    @Override
-    public void onProviderEnabled(String arg0) {
-    }
-
-    @Override
-    public void onStatusChanged(String arg0, int arg1, Bundle arg2) {
     }
 
     public TrackerState getState() {
