@@ -21,6 +21,10 @@ import android.annotation.TargetApi;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -41,6 +45,7 @@ import org.runnerup.tracker.filter.GPSAccKalmanFilter;
 import org.runnerup.tracker.filter.GeoPoint;
 import org.runnerup.util.TickListener;
 
+import java.util.ArrayList;
 import java.util.Locale;
 
 import static android.location.LocationManager.GPS_PROVIDER;
@@ -51,21 +56,51 @@ import static android.location.LocationManager.PASSIVE_PROVIDER;
  * Created by jonas on 12/11/14.
  */
 @TargetApi(Build.VERSION_CODES.FROYO)
-public class TrackerGPS extends DefaultTrackerComponent implements TickListener, LocationListener {
+public class TrackerGPS extends DefaultTrackerComponent
+        implements TickListener, LocationListener, SensorEventListener {
 
+    /** Logging tag. */
     public static final String TAG = "TrackerGPS";
 
     private boolean mWithoutGps = false;
     private int frequency_ms = 0;
-    private Location mLastLocation;
-    private Location m2ndLastLocation;
     private final Tracker tracker;
 
     private static final String NAME = "GPS";
     private GpsStatus mGpsStatus;
     private Callback mConnectCallback;
 
+    /** Kalman filter fusing GPS and acceleration for a smooth track. */
     private GPSAccKalmanFilter mKalmanFilter;
+    /** Filtered last locations used to calculate the bearing/heading of the movement. */
+    private Location mLastLocation;
+    private Location m2ndLastLocation;
+    /** Round speed and acceleration to avoid high precision floating
+     * shouldn't be necessary because KF should filter it out - however, for debugging reasons. */
+    private static final boolean mRound = true;
+
+    /** Rotation matrix to transform acceleration to the world coordinate system.*/
+    private float[] mRinv = new float[16];
+    /** Acceleration in world coordinate system. **/
+    private float[] mAcceleration = new float[4];
+    /** Raw acceleration from accelerometer. **/
+    private float[] mAccelerationRaw = new float[3];
+    /** Raw magnetic field values. */
+    private float[] mGeomagnetic = new float[3];
+    /** Estimate of the gravity along x,y,z (gravity removed from the accelerometer values). */
+    private float[] mGravity = new float[3];
+
+    /** Sensor types to request from the SensorManager. */
+    private static int[] mSensorTypes = {
+            Sensor.TYPE_ACCELEROMETER,
+            Sensor.TYPE_MAGNETIC_FIELD
+            // TODO: API9
+            //Sensor.TYPE_LINEAR_ACCELERATION,
+            //Sensor.TYPE_ROTATION_VECTOR
+    };
+    /** Sensors. */
+    private ArrayList<Sensor> mSensors = new ArrayList<Sensor>();
+
 
     @Override
     public String getName() {
@@ -74,6 +109,15 @@ public class TrackerGPS extends DefaultTrackerComponent implements TickListener,
 
     public TrackerGPS(Tracker tracker) {
         this.tracker = tracker;
+    }
+
+    public boolean startSensors(Context context) {
+
+        return true;
+    }
+
+    public void stopSensors(Context context) {
+
     }
 
     @Override
@@ -85,6 +129,20 @@ public class TrackerGPS extends DefaultTrackerComponent implements TickListener,
             }
             if (lm.getProvider(LocationManager.GPS_PROVIDER) == null) {
                 return ResultCode.RESULT_NOT_SUPPORTED;
+            }
+
+            // init sensors
+            SensorManager sm = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
+            for (Integer st : mSensorTypes) {
+                Sensor sensor = sm.getDefaultSensor(st);
+                if (sensor == null) {
+                    Log.e(TAG, String.format("No sensor for type %d (skip acceleration data)", st));
+                    // strange -- there is no accelerometer or we cannot get the phone's rotation
+                    // so let's set acceleration to 0 and let the KF run without it
+                    mAcceleration[0] = mAcceleration[1] = mAcceleration[2] = 0;
+                    break;
+                }
+                mSensors.add(sensor);
             }
         } catch (Exception ex) {
             return ResultCode.RESULT_ERROR;
@@ -100,6 +158,15 @@ public class TrackerGPS extends DefaultTrackerComponent implements TickListener,
             mWithoutGps = true;
         }
         try {
+            // register sensor listeners (accelerometer, geomagnetic)
+            SensorManager sm = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
+            for (Sensor sensor : mSensors) {
+                if (!sm.registerListener(this, sensor, 100000)) { // 100ms
+                    Log.e(TAG, String.format("Cannot register listener for sensor type %d", sensor.getType()));
+                    break;
+                }
+            }
+
             LocationManager lm = (LocationManager) context.getSystemService(Context.LOCATION_SERVICE);
             SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(context);
             frequency_ms = Integer.valueOf(preferences.getString(context.getString(
@@ -136,8 +203,6 @@ public class TrackerGPS extends DefaultTrackerComponent implements TickListener,
                 gpsLessLocationProvider.run();
                 return ResultCode.RESULT_OK;
             }
-
-
         } catch (Exception ex) {
             return ResultCode.RESULT_ERROR;
         }
@@ -167,6 +232,13 @@ public class TrackerGPS extends DefaultTrackerComponent implements TickListener,
             mGpsStatus = null;
             mConnectCallback = null;
         }
+
+        // unregister sensors
+        SensorManager sm = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
+        for (Sensor sensor : mSensors) {
+            sm.unregisterListener(this, sensor);
+        }
+
         return ResultCode.RESULT_OK;
     }
 
@@ -258,6 +330,7 @@ public class TrackerGPS extends DefaultTrackerComponent implements TickListener,
         // the location manager also provides us the speed (no need to derive it ;)
         v = location.getSpeed();
         // split speed into x/y direction using the bearing/heading of the movement
+        // TODO: estimate heading with KF (see also AP18 TYPE_ROTATION_VECTOR)
         if (location.hasBearing()) // from location
             heading = location.getBearing();
         else if (mLastLocation != null  &&  m2ndLastLocation != null)
@@ -278,14 +351,13 @@ public class TrackerGPS extends DefaultTrackerComponent implements TickListener,
             Log.d(TAG, "(re-)initialize KF");
             // initialize the acceleration variance with a high value as we don't provide controls
             mKalmanFilter = new GPSAccKalmanFilter(false,
-                    x, y, vx, vy, 0.1, sigma*sigma, timestamp,
+                    x, y, vx, vy, 1, sigma*sigma, timestamp,
                     1, 1);
         }
 
         // filter
         // forward estimate the position and velocity
-        // TODO: get accelerometer data as control input
-        mKalmanFilter.predict(timestamp, 0, 0);
+        mKalmanFilter.predict(timestamp, mAcceleration[0], mAcceleration[1]);
         // correct the estimate given the current location
         mKalmanFilter.update(timestamp, x, y, vx, vy, sigma, v_sigma);
 
@@ -299,7 +371,8 @@ public class TrackerGPS extends DefaultTrackerComponent implements TickListener,
         vx = mKalmanFilter.getCurrentXVel();
         vy = mKalmanFilter.getCurrentYVel();
         v = (vx + vy) / 2;
-        v = Math.round(v*1000) / 1000; // avoid high precision floating
+        if (mRound)
+            v = Math.round(v * 1000.0) / 1000.0; // avoid high precision floating
         heading = Math.atan2(vy, vx);
         filteredLocation.setSpeed((float) v);
         filteredLocation.setBearing((float) heading);
@@ -325,4 +398,68 @@ public class TrackerGPS extends DefaultTrackerComponent implements TickListener,
 
     }
     /* LocationListener implementation -- end */
+
+    private void logAcceleration(String description, float[] acceleration) {
+        assert acceleration.length >= 3;
+        long timestamp = SystemClock.elapsedRealtime(); // monotonic clock (ms)
+        String strAcceleration = String.format(Locale.getDefault(),
+                "time=%d, ax=%f, ay=%f, az=%f", timestamp,
+                acceleration[0], acceleration[1], acceleration[2]
+        );
+        Log.d(TAG, description + ": " + strAcceleration);
+    }
+
+    /* SensorEventListener implementation -- start */
+    @Override
+    public void onSensorChanged(SensorEvent event) {
+        float[] R = new float[16];
+        float[] linearAcceleration = new float[4];
+
+        switch (event.sensor.getType()) {
+            case Sensor.TYPE_MAGNETIC_FIELD:
+                System.arraycopy(event.values, 0, mGeomagnetic, 0, event.values.length);
+                SensorManager.getRotationMatrix(R, mRinv, mAccelerationRaw, mGeomagnetic);
+                break;
+            case Sensor.TYPE_ACCELEROMETER:
+                System.arraycopy(event.values, 0, mAccelerationRaw, 0, event.values.length);
+                //logAcceleration("raw acceleration", mAccelerationRaw);
+
+                // low-pass filter to remove gravity from accelerometer values
+                float alpha = 0.8f;
+
+                mGravity[0] = alpha * mGravity[0] + (1 - alpha) * event.values[0];
+                mGravity[1] = alpha * mGravity[1] + (1 - alpha) * event.values[1];
+                mGravity[2] = alpha * mGravity[2] + (1 - alpha) * event.values[2];
+
+                linearAcceleration[0] = event.values[0] - mGravity[0];
+                linearAcceleration[1] = event.values[1] - mGravity[1];
+                linearAcceleration[2] = event.values[2] - mGravity[2];
+                //logAcceleration("linear acceleration", linearAcceleration);
+                // fall through
+            case Sensor.TYPE_LINEAR_ACCELERATION:
+                // API9
+                //System.arraycopy(event.values, 0, linearAcceleration, 0, event.values.length);
+                // transform the acceleration to world coordinates: world = inv(R) * linAcc
+                android.opengl.Matrix.multiplyMV(mAcceleration, 0, mRinv, 0, linearAcceleration, 0);
+                // avoid high precision floating for debugging (acceleration drift?)
+                if (mRound) {
+                    mAcceleration[0] = Math.round(mAcceleration[0] * 10.0f) / 10.0f;
+                    mAcceleration[1] = Math.round(mAcceleration[1] * 10.0f) / 10.0f;
+                    mAcceleration[2] = Math.round(mAcceleration[2] * 10.0f) / 10.0f;
+                }
+                //logAcceleration("world acceleration", mAcceleration);
+                break;
+            case Sensor.TYPE_ROTATION_VECTOR:
+                // API9
+                //SensorManager.getRotationMatrixFromVector(R, event.values);
+                //android.opengl.Matrix.invertM(Rinv, 0, R, 0);
+                break;
+        }
+    }
+
+    @Override
+    public void onAccuracyChanged(Sensor sensor, int i) {
+
+    }
+    /* SensorEventListener implementation -- end */
 }

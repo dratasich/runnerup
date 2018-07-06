@@ -25,8 +25,6 @@ Copied from https://github.com/maddevsio/mad-location-manager
 package org.runnerup.tracker.filter;
 
 
-import android.location.Location;
-
 /**
  * Created by lezh1k on 2/13/18.
  */
