@@ -72,12 +72,11 @@ public class TrackerGPS extends DefaultTrackerComponent
 
     /** Kalman filter fusing GPS and acceleration for a smooth track. */
     private GPSAccKalmanFilter mKalmanFilter;
-    /** Filtered last locations used to calculate the bearing/heading of the movement. */
+    /** Filtered location, estimate after last GPS update. */
     private Location mLastLocation;
-    private Location m2ndLastLocation;
     /** Round speed and acceleration to avoid high precision floating
      * shouldn't be necessary because KF should filter it out - however, for debugging reasons. */
-    private static final boolean mRound = true;
+    private static final boolean mRound = false;
 
     /** Rotation matrix to transform acceleration to the world coordinate system.*/
     private float[] mRinv = new float[16];
@@ -109,15 +108,6 @@ public class TrackerGPS extends DefaultTrackerComponent
 
     public TrackerGPS(Tracker tracker) {
         this.tracker = tracker;
-    }
-
-    public boolean startSensors(Context context) {
-
-        return true;
-    }
-
-    public void stopSensors(Context context) {
-
     }
 
     @Override
@@ -292,6 +282,7 @@ public class TrackerGPS extends DefaultTrackerComponent
         tmp.run(this, ResultCode.RESULT_OK);
     }
 
+
     private void logLocation(String description, Location location) {
         String strLocation = String.format(Locale.getDefault(),
                 "time=%d, lat=%f, long=%f, alt=%f, acc=%f, bearing=%f, speed=%f",
@@ -327,15 +318,15 @@ public class TrackerGPS extends DefaultTrackerComponent
         y = Coordinates.latitudeToMeters(latitude);
         // use the accuracy (m) given by the location manager as measurement variance of x/y
         sigma = location.getAccuracy();
-        // the location manager also provides us the speed (no need to derive it ;)
+        // the location manager also provides us the speed
         v = location.getSpeed();
         // split speed into x/y direction using the bearing/heading of the movement
         // TODO: estimate heading with KF (see also AP18 TYPE_ROTATION_VECTOR)
         if (location.hasBearing()) // from location
             heading = location.getBearing();
-        else if (mLastLocation != null  &&  m2ndLastLocation != null)
-            // based on the last filtered locations
-            heading = m2ndLastLocation.bearingTo(mLastLocation);
+        else if (mLastLocation != null)
+            // based on the last filtered location (bearing via vx/vy estimated by KF)
+            heading = mLastLocation.getBearing();
         else
             heading = 0;
         // the KF uses the speed to forward estimate the position (at the next time step)
@@ -349,38 +340,41 @@ public class TrackerGPS extends DefaultTrackerComponent
         if (mKalmanFilter == null ||
                 location.distanceTo(mLastLocation) > 2*(sigma + mLastLocation.getAccuracy())) {
             Log.d(TAG, "(re-)initialize KF");
-            // initialize the acceleration variance with a high value as we don't provide controls
-            mKalmanFilter = new GPSAccKalmanFilter(false,
-                    x, y, vx, vy, 1, sigma*sigma, timestamp,
-                    1, 1);
+            // create the KF, use location (position[, speed]) and accelerometer
+            boolean useGPSSpeed = location.hasSpeed();
+            mKalmanFilter = new GPSAccKalmanFilter(useGPSSpeed,
+                    x, y, vx, vy,
+                    // *Dev and *Factor define the influence of the measurements (magnitude~1/trust)
+                    0.1, sigma, timestamp, 1, 1);
+            // first predict to make update possible
+            // upcoming predicts are performed when we receive accelerometer data
+            mKalmanFilter.predict(timestamp, 0, 0);
         }
 
-        // filter
-        // forward estimate the position and velocity
-        mKalmanFilter.predict(timestamp, mAcceleration[0], mAcceleration[1]);
         // correct the estimate given the current location
         mKalmanFilter.update(timestamp, x, y, vx, vy, sigma, v_sigma);
 
-        // set filtered location
-        Location filteredLocation = new Location(location);
+        // get and save current estimate
+        mLastLocation = new Location(location);
         GeoPoint p = Coordinates.metersToGeoPoint(
                 mKalmanFilter.getCurrentX(),
                 mKalmanFilter.getCurrentY());
-        filteredLocation.setLongitude(p.Longitude);
-        filteredLocation.setLatitude(p.Latitude);
+        mLastLocation.setLongitude(p.Longitude);
+        mLastLocation.setLatitude(p.Latitude);
         vx = mKalmanFilter.getCurrentXVel();
         vy = mKalmanFilter.getCurrentYVel();
-        v = (vx + vy) / 2;
+        v = Math.sqrt(vx*vx + vy*vy);
         if (mRound)
             v = Math.round(v * 1000.0) / 1000.0; // avoid high precision floating
-        heading = Math.atan2(vy, vx);
-        filteredLocation.setSpeed((float) v);
-        filteredLocation.setBearing((float) heading);
-        tracker.onLocationChanged(filteredLocation);
+        mLastLocation.setSpeed((float) v);
+        heading = 0;
+        if (vx > 0.01)
+            heading = Math.atan2(vy, vx);
+        // fix, bearing has always a wrong value (about 358-1)
+        mLastLocation.setBearing((float) heading);
 
-        logLocation("filtered", filteredLocation);
-        mLastLocation = filteredLocation;
-        m2ndLastLocation = mLastLocation;
+        tracker.onLocationChanged(mLastLocation);
+        logLocation("filtered", mLastLocation);
     }
 
     @Override
@@ -447,6 +441,13 @@ public class TrackerGPS extends DefaultTrackerComponent
                     mAcceleration[1] = Math.round(mAcceleration[1] * 10.0f) / 10.0f;
                     mAcceleration[2] = Math.round(mAcceleration[2] * 10.0f) / 10.0f;
                 }
+
+                // forward estimate the last position and velocity using the accelerometer data
+                if (mKalmanFilter != null) {
+                    double timestamp = SystemClock.elapsedRealtime(); // monotonic clock (ms)
+                    mKalmanFilter.predict(timestamp, mAcceleration[0], mAcceleration[1]);
+                }
+
                 //logAcceleration("world acceleration", mAcceleration);
                 break;
             case Sensor.TYPE_ROTATION_VECTOR:

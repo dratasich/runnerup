@@ -24,6 +24,7 @@ Copied from https://github.com/maddevsio/mad-location-manager
 
 package org.runnerup.tracker.filter;
 
+// TODO: asserts have no effect!
 
 /**
  * Created by lezh1k on 2/13/18.

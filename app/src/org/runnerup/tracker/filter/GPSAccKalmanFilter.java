@@ -51,7 +51,7 @@ public class GPSAccKalmanFilter {
         int mesDim = useGpsSpeed ? 4 : 2;
         m_useGpsSpeed = useGpsSpeed;
 
-        m_kf = new KalmanFilter(4, mesDim, 1);
+        m_kf = new KalmanFilter(4, mesDim, 2);
         m_timeStampMsPredict = m_timeStampMsUpdate = timeStampMs;
         m_accSigma = accDev;
         m_predictCount = 0;
@@ -153,10 +153,10 @@ public class GPSAccKalmanFilter {
                        double xVel,
                        double yVel,
                        double posDev,
-                       double velErr) {
+                       double velDev) {
         m_predictCount = 0;
         m_timeStampMsUpdate = timeStamp;
-        rebuildR(posDev, velErr);
+        rebuildR(posDev*posDev, velDev*velDev);
         m_kf.Zk.setData(x, y, xVel, yVel);
         m_kf.update();
     }
